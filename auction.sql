@@ -1,3 +1,24 @@
+-- Threshold Reqs:
+-- T-Req 1: By default, users can only increase bids by 5 cents (minimum increase bid);
+-- T-Req 2: These thresholds should be easily configurable within a table so there is no need to change the database;
+-- T-Req 3: These thresholds should be global and not per product/category;
+-- T-Req 4: This campaign takes place during the last two weeks of November including Black Friday;
+
+-- Auction Reqs:
+-- A-Req 1: Only products that are currently commercialized (both SellEndDate and DiscontinuedDate values not set);
+-- A-Req 2: Only one item for each ProductID can be simultaneously enlisted as an auction;
+
+-- Bids Reqs:
+-- B-Req 1: Maximum bid limit that is equal to initial product listed price
+-- B-Req 2: Initial bid price for products that are not manufactured in-house (MakeFlag value is 0) should be 75% of listed price;
+-- B-Req 3: Initial bid price for products that are manufactured in-house (MakeFlag value is 1) should be 50% of listed price;
+
+-- Technical Reqs:
+-- Tech-Req 1: All new database objects should be created within Auction schema;
+-- Tech-Req 2: T-SQL script should also pre-populate any required configuration tables with default values;
+-- Tech-Req 3: Being idempotent, this population should be just performed once no matter how many times t-SQL script is executed;
+-- Tech-Req 4: All stored procedures should have proper error/exception handling mechanism;
+
 USE AdventureWorks
 GO
 
@@ -7,8 +28,16 @@ IF NOT EXISTS (SELECT 1 FROM sys.schemas WHERE name = N'Auction')
     END
 GO
 
-
-
+-- AuctionedProducts: This table stores information about the products that are being auctioned.
+    -- It contains columns such as AuctionID (primary key), ProductID, StartDate, ExpireDate, EndDate, InitialBidPrice, Status and WinnerBid.
+    -- AuctionID is an identity column and serves as the primary key of this table.
+    -- ProductID is a FK that references the ProductID column of the Production.Product table,
+    -- maintaining data integrity and consistency in the database adding only existing Products.
+    -- StartDate and ExpireDate columns specify the start and end time of the auction.
+    -- The EndDate column stores the UTC date when the auction is closed or canceled.
+    -- The InitialBidPrice column specifies the minimum bid value for the first bid.
+    -- The Status column indicates the current status of the auction, which can be "Active", "Closed", or "Cancelled".
+    -- The WinnerBid column stores the BidID of the winning bid when the auction is closed.
 IF NOT EXISTS(SELECT *
               FROM sys.tables
               WHERE name = 'AuctionedProducts')
@@ -31,11 +60,19 @@ IF NOT EXISTS(SELECT *
 	END
 GO
 
+-- Bids: This table stores information about all valid bids that are placed on auctioned products.
+    -- It contains columns such as BidID (primary key), CustomerID, AuctionID, BidAmount and BidDate.
+    -- BidID is an identity column and serves as the primary key of this table.
+    -- CustomerID is a foreign key that references the CustomerID column of the Sales.Customer table
+    -- maintaining data integrity and consistency in the database adding only existing Customers.
+    -- AuctionID is a foreign key that references the AuctionID column of the AuctionedProducts table.
+    -- maintaining data integrity and consistency in the database adding only existing AuctionedProducts.
+    -- BidAmount specifies the amount of the bid, and BidDate stores the UTC date and time when the bid was placed.
 IF NOT EXISTS(SELECT *
         FROM sys.tables
         WHERE name = 'Bids')
 	BEGIN
-		CREATE TABLE Auction.Bids 
+		CREATE TABLE Auction.Bids
 		(
 			BidID int IDENTITY(1,1) PRIMARY KEY,
 			CustomerID int NOT NULL,
@@ -45,9 +82,22 @@ IF NOT EXISTS(SELECT *
 			CONSTRAINT FK_AuctioID FOREIGN KEY (AuctionID) REFERENCES Auction.AuctionedProducts (AuctionID),
 			CONSTRAINT FK_CustomerID FOREIGN KEY (CustomerID) REFERENCES Sales.Customer (CustomerID)
 		);
+
+		ALTER TABLE Auction.AuctionedProducts
+			ADD CONSTRAINT FK_LastBidID
+				FOREIGN KEY (WinnerBid) REFERENCES Auction.Bids(BidID);
+
+		CREATE INDEX IX_Bids_AuctionId_BidAmount ON Auction.Bids (AuctionID,BidAmount)
 	END;
 GO
 
+-- Threshold: This table stores global configuration for bids and auctions.
+    -- It contains columns such as ThresholdID (primary key), MinimumIncreaseBid, MaxAuctionPrice, MinStartDate, and MaxExpireDate.
+    -- ThresholdID is an identity column and serves as the primary key of this table.
+    -- MinimumIncreaseBid specifies the minimum amount by which a bid must increase from the previous bid.
+    -- MaxAuctionPrice specifies the maximum price that can be reached in an auction, as a percentage of the productS value.
+    -- MinStartDate and MaxExpireDate specify the range of valid start and end times for auctions.
+    -- The MaxAuctionPrice column has a check constraint that ensures its value is between 0 and 1.
 IF NOT EXISTS(SELECT *
               FROM sys.tables
               WHERE name = 'Threshold')
@@ -62,10 +112,22 @@ IF NOT EXISTS(SELECT *
 			CONSTRAINT CK_MaxAuctionPrice CHECK (MaxAuctionPrice > 0 AND MaxAuctionPrice <= 1)
 		);
 
+        -- The purpose of this INSERT statement is to set the initial values for the global configuration of the threshold
+        -- values that are used to determine the valid bids and auctions,takes place during the last two weeks of November including Black Friday .
 		INSERT INTO Auction.Threshold (MinimumIncreaseBid, MaxAuctionPrice ,MinStartDate, MaxExpireDate) VALUES (0.05, 1, '2023-11-13 00:00:00', '2023-11-26 23:59:59');
 	END
 GO
 
+    -- Stored procedure name: uspAddProductToAuction
+    -- 1. Check if the product exists, is currently on sale, and has stock available to be cleared. If the product fails this check, the procedure raises an error and stops execution.
+    -- 2. Check if the product is already added to an active auction. If so, the procedure raises an error and stops execution.
+    -- 3. Check that the insertion date in UTC time is before the auction end limit. If the insertion date is after the limit, the procedure raises an error and stops execution.
+    -- 4. Check that the expiration date for the auction is within the valid date range. If the expiration date is outside this range, the procedure raises an error and stops execution.
+    -- 5. If an expiration date is not specified, set the expiration date to one week after the start date.
+    -- 6. Check if the initial bid price for the product is valid. If the initial bid price is not specified, set it to the minimum allowed value.
+    -- For products that are not manufactured in-house, set the initial bid price to 75% of the listed price. For products that are manufactured in-house, set the initial bid price to 50% of the listed price.
+    -- 8. <<NEED TO CHECK>> If the initial bid price is outside the valid bid range, set it to the maximum allowed value. If the initial bid price is too low, set it to the minimum allowed value.
+    -- 9. Insert the product into the AuctionedProducts table with the status set to "Active"
 CREATE OR ALTER PROCEDURE Auction.uspAddProductToAuction( @ProductID int, @ExpireDate datetime = NULL, @InitialBidPrice money= NULL)
 AS
 BEGIN
@@ -90,7 +152,11 @@ BEGIN
 	DECLARE @MinimumIncreaseBid money
 	DECLARE @MaxAuctionPrice float
 
-	SELECT @MinStartDate = MinStartDate, @MaxAuctionPrice = MaxAuctionPrice, @MaxExpireDate = MaxExpireDate, @MinimumIncreaseBid = MinimumIncreaseBid FROM Auction.Threshold
+	SELECT @MinStartDate = MinStartDate,
+	       @MaxAuctionPrice = MaxAuctionPrice,
+	       @MaxExpireDate = MaxExpireDate,
+	       @MinimumIncreaseBid = MinimumIncreaseBid
+	FROM Auction.Threshold
 
 	IF  @MaxExpireDate < GETUTCDATE()
 		BEGIN
@@ -116,7 +182,7 @@ BEGIN
 			IF @ExpireDate < @MinStartDate
 				BEGIN
 					DECLARE @msgtext varchar(100)
-					SET @msgtext = CONCAT('Expire date should be greater than',@MinStartDate)
+					SET @msgtext = CONCAT('Expire date should be greater than ',@MinStartDate)
 					RAISERROR (@msgtext, 16, 1)
 					RETURN
 				END
@@ -125,21 +191,10 @@ BEGIN
 					RAISERROR ('Expire date should be greater than the current date!', 16, 1)
 					RETURN
 				END
-			--IF @ExpireDate > @MaxExpireDate --CONVERT(DATETIME,'2023-11-26 23:59:59')
-			--	BEGIN
-			--		SET @ExpireDate = @MaxExpireDate  ---'2023-11-26 23:59:59'
-			--	END
 		END
 	ELSE
 		BEGIN
-			IF DATEADD(d,7,@MinStartDate) <  @MaxExpireDate    --(SELECT DATEDIFF(second, DATEADD(d,7,GETUTCDATE()), (SELECT CONVERT(DATETIME,'2023-11-26 23:59:59')))) > 0
-				BEGIN
-					SET @ExpireDate = DATEADD(d,7,@MinStartDate)
-				END
-			ELSE
-				BEGIN
-					SET @ExpireDate = @MaxExpireDate
-				END
+			SET @ExpireDate = DATEADD(d,7,@StartDate)
 		END
 
 --CHECK IF @InitialBidPrice VALIDITY
@@ -154,7 +209,7 @@ BEGIN
 	SELECT @MakeFlag = MakeFlag, @MaxBidPrice = ListPrice*@MaxAuctionPrice
 	FROM Production.Product
 	WHERE ProductID = @ProductID
-	
+
 	DECLARE @MinBidPrice money
 
 	If @MakeFlag = 0
@@ -191,6 +246,17 @@ BEGIN
 END
 GO
 
+-- Stored procedure name: uspTryBidProduct
+-- 1. The stored procedure checks to make sure that the @CustomerID provided exists in the Sales.Customer table. If the customer does not exist, an error message is raised and the procedure terminates.
+-- 2. The stored procedure checks whether the product specified by the @ProductID is currently active in an auction by querying the Auction.AuctionedProducts table. If the product is not being auctioned or if the auction has expired, an error message is raised and the procedure terminates.
+-- 3. If the auction is active but it is too early to bid, the stored procedure will raise an error message and terminate.
+-- 4. The stored procedure checks whether the @BidAmount is specified by the customer
+    -- If the @BidAmount is not provided by the customer:
+        -- The stored procedure will determine the initial bid price or the highest bid amount so far and add the minimum increase bid amount specified in the Auction.Threshold table to it.
+    -- If the @BidAmount is provided:
+        -- The stored procedure will check that the bid amount is greater than or equal to the current highest bid amount plus the minimum increase bid amount.
+-- 5. The stored procedure checks whether the @BidAmount specified is less than or equal to the maximum bid price, which is calculated as the products list price multiplied by a maximum auction price specified in the Auction.Threshold table.
+-- 6. If all of the above checks pass, the stored procedure inserts a new row into the Auction.Bids table with the specified @CustomerID, @AuctionID, @BidAmount, and the current datetime.
 CREATE OR ALTER PROCEDURE Auction.uspTryBidProduct (@ProductID int, @CustomerID int, @BidAmount money = NULL)
 AS
 BEGIN
@@ -201,7 +267,7 @@ BEGIN
 	SELECT @AuctionID = AuctionID, @InitialBidPrice = InitialBidPrice
 	FROM Auction.AuctionedProducts
 	WHERE ProductID = @ProductID AND Status = 'Active'
-	
+
 	DECLARE @MinIncrease money
 	DECLARE @MaxAuctionPrice float
 	DECLARE @ExpireDate datetime
@@ -233,10 +299,7 @@ BEGIN
 			RETURN
 		END
 
---CHECK IF @BidAmount is valid
-
-
---Check BidAmount validit
+--Check BidAmount valid
 	DECLARE @MaxBid money
 	SELECT @MaxBid = MAX(BidAmount)
 	FROM Auction.Bids
@@ -255,6 +318,12 @@ BEGIN
 		END
 	ELSE
 		BEGIN
+			IF  @MaxBid IS NULL
+				BEGIN
+					IF @BidAmount < @InitialBidPrice
+					RAISERROR('Bid too Low!',16,1)
+					RETURN
+				END
 			IF @BidAmount < @MaxBid+@MinIncrease
 				BEGIN
 					RAISERROR('Bid too Low!',16,1)
@@ -263,7 +332,7 @@ BEGIN
 		END
 
 --CHECK IF @BidAmount is above ListPrice
-	IF @BidAmount > @MaxBidPrice 
+	IF @BidAmount > @MaxBidPrice
 		BEGIN
 			RAISERROR('Bid amount is above the limit',16,1)
 			RETURN
@@ -276,7 +345,11 @@ BEGIN
 END
 GO
 
-
+-- Stored procedure name: upsRemoveProductFromAuction
+-- 1. That removes a product from an ongoing auction. It takes an input parameter called @ProductID, which is an integer value representing the ID of the product to be removed.
+-- 2. The procedure first checks if the product with the specified ID is currently in an active auction by querying the AuctionedProducts table. If the product is not found in an active auction, the procedure raises an error and exits.
+-- 3. If the product is found in an active auction, the procedure updates the Status and EndDate columns of the corresponding row in the AuctionedProducts table. The Status is changed to 'Cancelled', indicating that the auction for the product has been cancelled, and the EndDate is set to the current UTC date and time.
+-- 4. The procedure does not return any result sets, but it may raise an error if the input parameter is invalid or if there is a problem with updating the database.
 CREATE OR ALTER PROCEDURE Auction.upsRemoveProductFromAuction (@ProductID INT)
 AS
 BEGIN
@@ -294,54 +367,58 @@ BEGIN
 END
 GO
 
+-- Stored procedure name: upsListBidOffersHistory
+-- 1. The procedure takes four input parameters: @CustomerID, @StartTime, @EndTime, and @Active.
+-- 2. The procedure first checks if the specified @CustomerID has ever placed a bid on any product in the Auction.Bids table.
+    -- If there are no records in the Auction.Bids table with the specified @CustomerID, the procedure raises an error message with severity level 16 and returns control to the calling program without executing any further code.
+-- 3. If the @Active parameter is set to 1, the procedure retrieves the bid offers history for the specified @CustomerID within the specified date range where the corresponding auctioned product is still active.
+-- 4. If the @Active parameter is not set to 1, the procedure retrieves the bid offers history for the specified @CustomerID within the specified date range, regardless of the status of the corresponding auctioned product.
+-- 5. The procedure returns the retrieved bid offers history.
 CREATE OR ALTER PROCEDURE Auction.upsListBidOffersHistory(@CustomerID INT, @StartTime datetime, @EndTime datetime, @Active bit = 1)
 AS
 BEGIN
-	IF NOT EXISTS(SELECT CustomerID FROM Auction.Bids WHERE CustomerID = @CustomerID)
-		BEGIN
-			RAISERROR ('The inserted Customer never bid a product!', 16, 1);
-			RETURN;
-		END
-	ELSE
-		BEGIN
-			IF @Active = 1
-				BEGIN
-					 (SELECT b.BidID, b.AuctionID, a.ProductID, b.BidAmount, b.BidDate
-							FROM Auction.Bids as b
-							JOIN Auction.AuctionedProducts as a
-							ON b.AuctionID = a.AuctionID
-							WHERE b.CustomerID = @CustomerID AND b.BidDate >= @StartTime AND b.BidDate <= @EndTime AND a.Status = 'Active')
-				END
-			ELSE
-				BEGIN
-					 (SELECT b.BidID, b.AuctionID, a.ProductID, b.BidAmount, b.BidDate
-							FROM Auction.Bids as b
-							JOIN Auction.AuctionedProducts as a
-							ON b.AuctionID = a.AuctionID
-							WHERE b.CustomerID = @CustomerID AND b.BidDate >= @StartTime AND b.BidDate <= @EndTime)
-				END
-		END
+    IF NOT EXISTS(SELECT CustomerID FROM Auction.Bids WHERE CustomerID = @CustomerID)
+        BEGIN
+            RAISERROR ('The inserted Customer never bid a product!', 16, 1);
+            RETURN;
+        END
+
+    IF @Active = 1
+        BEGIN
+            SELECT b.BidID, b.AuctionID, a.ProductID, b.BidAmount, b.BidDate
+            FROM Auction.Bids as b
+                     JOIN Auction.AuctionedProducts as a ON b.AuctionID = a.AuctionID
+            WHERE b.CustomerID = @CustomerID AND b.BidDate >= @StartTime AND b.BidDate <= @EndTime AND a.Status = 'Active'
+        END
+    ELSE
+        BEGIN
+            SELECT b.BidID, b.AuctionID, a.ProductID, b.BidAmount, b.BidDate
+            FROM Auction.Bids as b
+                     JOIN Auction.AuctionedProducts as a ON b.AuctionID = a.AuctionID
+            WHERE b.CustomerID = @CustomerID AND b.BidDate >= @StartTime AND b.BidDate <= @EndTime
+        END
 END
 GO
 
+-- Stored procedure name: uspUpdateAuctionStatus
+-- 1. That updates the status of an active auction to "Closed" and sets the EndDate of the auction to the current UTC date and time. It also sets the WinnerBid to the BidID of the customer who placed the highest bid in the auction.
+-- 2. The procedure first starts a transaction using the BEGIN TRANSACTION statement, and then executes an UPDATE statement to change the status of the active auctioned products that have expired based on the ExpireDate field. The subquery in the UPDATE statement finds the highest bid placed by a customer in the auction and sets the WinnerBid field of the corresponding auction product to the BidID of the winning bid.
+-- 3. Check the transaction
+    -- If the UPDATE statement is successful, the transaction is committed using the COMMIT TRANSACTION statement.
+    -- If an error occurs during the transaction, the CATCH block is executed, and the transaction is rolled back using the ROLLBACK TRANSACTION statement. The procedure also prints the error message and throws a custom error message using the THROW statement.
 CREATE OR ALTER PROCEDURE Auction.uspUpdateAuctionStatus
 AS
 BEGIN
 	BEGIN TRY
 		BEGIN TRANSACTION
 			UPDATE Auction.AuctionedProducts
-			SET WinnerBid = (SELECT TOP 1 BidID
-			FROM Auction.AuctionedProducts p
-			JOIN Auction.Bids b ON b.AuctionID = p.AuctionID
-			WHERE p.Status = 'Active' AND p.ExpireDate < GETUTCDATE() 
-			ORDER BY b.BidAmount desc)
-			WHERE AuctionID IN (SELECT P.AuctionID
-			FROM Auction.AuctionedProducts p
-			JOIN Auction.Bids b ON b.AuctionID = p.AuctionID
-			WHERE p.Status = 'Active' AND p.ExpireDate < GETUTCDATE())
-	
-			UPDATE Auction.AuctionedProducts
-			SET Status = 'Closed', EndDate = GETUTCDATE()
+			SET Status = 'Closed',EndDate = GETUTCDATE(),
+				WinnerBid = (
+					SELECT TOP 1 Auction.Bids.BidID
+					FROM Auction.Bids
+					WHERE Auction.Bids.AuctionID = Auction.AuctionedProducts.AuctionID
+					ORDER BY BidAmount DESC
+				)
 			WHERE Status = 'Active' AND ExpireDate < GETUTCDATE()
 		COMMIT TRANSACTION
 	END TRY
@@ -353,6 +430,6 @@ BEGIN
 		END
 		PRINT ERROR_MESSAGE();
 		THROW 50001,'An insert failed. The transaction was cancelled.', 0;
-	END CATCH;		
+	END CATCH;
 END
 GO
